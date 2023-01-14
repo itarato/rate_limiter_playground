@@ -1,11 +1,62 @@
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
+use log::info;
 use simple_logger::SimpleLogger;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    spawn, time,
+    spawn,
+    sync::Mutex,
+    time,
 };
+
+struct RateLimiter {
+    bucket: u64,
+    limit: u64,
+    rate: f64, // Per second.
+    last_update: SystemTime,
+}
+
+impl RateLimiter {
+    fn new(limit: u64, rate: f64) -> Self {
+        Self {
+            bucket: limit,
+            limit,
+            rate,
+            last_update: std::time::SystemTime::now(),
+        }
+    }
+
+    fn is_allow(&mut self, req: u64) -> bool {
+        // Refill.
+        let elapsed = self
+            .last_update
+            .elapsed()
+            .expect("Failed calculating elapsed time")
+            .as_millis();
+        self.last_update = SystemTime::now();
+
+        let new_tokens = (((elapsed as f64) / 1000.0) * self.rate) as u64;
+        let new_cap = new_tokens.min(self.limit - self.bucket);
+
+        info!(
+            "Bucket refilled {} -> {}",
+            self.bucket,
+            self.bucket + new_cap
+        );
+        self.bucket += new_cap;
+
+        if self.bucket >= req {
+            self.bucket -= req;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 async fn proxy(len: usize, msg: &[u8]) -> Result<(usize, [u8; 32]), &str> {
     let mut socket = TcpStream::connect("127.0.0.1:5678")
@@ -37,9 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:6789").await?;
     log::info!("Listening on 6789");
 
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(10, 5.0)));
+
     loop {
         let (mut stream, addr) = listener.accept().await?;
         log::info!("Incoming connection from: {}", addr);
+
+        let _rate_limiter = rate_limiter.clone();
 
         spawn(async move {
             let mut buf: [u8; 32] = [0; 32];
@@ -47,6 +102,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match stream.read(&mut buf).await {
                 Ok(len) => {
                     log::info!("Incoming msg: {}", String::from_utf8_lossy(&mut buf));
+
+                    if !_rate_limiter.lock().await.is_allow(len as u64) {
+                        log::warn!("Request throttled");
+
+                        match stream.write(b"no").await {
+                            Ok(_) => log::info!("Ping deny"),
+                            Err(err) => log::error!("Ping deny error: {}", err),
+                        };
+
+                        return;
+                    }
 
                     match proxy(len, &buf).await {
                         Ok((len, mut resp)) => {

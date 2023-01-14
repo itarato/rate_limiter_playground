@@ -1,5 +1,5 @@
 [package]
-name = "client"
+name = "token_bucket"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,4 +9,3 @@ edition = "2021"
 tokio = { version = "1.24.1", features = ["full"] }
 simple_logger = "4.0.0"
 log = "0.4"
-clap = { version = "4.1.1", features = ["derive"] }
