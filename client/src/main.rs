@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         });
         join_handles.push(join_handle);
+
+        time::sleep(Duration::from_millis(args.gap)).await;
     }
 
     for join_handle in join_handles {
