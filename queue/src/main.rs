@@ -27,7 +27,7 @@ enum Request {
     Poll(u64),
 }
 
-async fn call_server(mut msg: Vec<u8>) -> Result<(usize, [u8; 32]), Box<dyn Error>> {
+async fn call_server(mut msg: Vec<u8>) -> Result<(Vec<u8>), Box<dyn Error>> {
     let mut socket = TcpStream::connect("127.0.0.1:5678")
         .await
         .map_err(|_| "Cannot connect to server")?;
@@ -47,79 +47,70 @@ async fn call_server(mut msg: Vec<u8>) -> Result<(usize, [u8; 32]), Box<dyn Erro
         .map_err(|_| "Read from server failed")?;
     log::info!("Got back: {}", String::from_utf8_lossy(&mut buf));
 
-    Ok((read_len, buf))
+    Ok(buf[..read_len].to_vec())
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<Request> {
+async fn read_request(stream: &mut TcpStream) -> Result<Request, Box<dyn Error>> {
     let mut buf: [u8; 32] = [0; 32];
-    let read_res = stream.read(&mut buf).await;
-
-    if read_res.is_err() {
-        log::error!("Read error: {}", read_res.unwrap_err());
-        return None;
-    }
-    let read_len = read_res.unwrap();
+    let read_len = stream.read(&mut buf).await?;
 
     if read_len == b"POLL".len() + 8 && buf[8..12] == b"POLL"[..] {
-        let poll_key = u64::from_be_bytes(buf[..8].try_into().expect("Cannot read poll key"));
-        Some(Request::Poll(poll_key))
+        let poll_key = u64::from_be_bytes(buf[..8].try_into()?);
+        Ok(Request::Poll(poll_key))
     } else if read_len >= 8 {
-        let request_key = u64::from_be_bytes(buf[..8].try_into().expect("Cannot read request key"));
+        let request_key = u64::from_be_bytes(buf[..8].try_into()?);
         if request_key > 0 {
-            Some(Request::AuthorizedRequest(request_key, buf[8..].to_vec()))
+            Ok(Request::AuthorizedRequest(request_key, buf[8..].to_vec()))
         } else {
-            Some(Request::UnauthorizedRequest(buf[8..].to_vec()))
+            Ok(Request::UnauthorizedRequest(buf[8..].to_vec()))
         }
     } else {
         log::error!("Invalid request: {:?}", buf);
-        None
+        Err("Invalid request".into())
     }
 }
 
-async fn handle_request(mut stream: TcpStream, rate_limiter: Arc<Mutex<RateLimiter>>) {
-    match call_server(vec![]).await {
-        Ok(_) => {}
-        Err(a) => log::error!("{}", a),
-    };
+async fn handle_request(
+    mut stream: TcpStream,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<(), Box<dyn Error>> {
+    let response = read_request(&mut stream).await?;
 
-    // match read_request(&mut stream).await {
-    //     Some(Request::UnauthorizedRequest(mut msg)) => {
-    //         // Can be served?
-    //         // - yes -> call_server(...)
-    //         // - no  -> send back poll with key
+    match response {
+        Request::UnauthorizedRequest(msg) => {
+            // Can be served?
+            // - yes -> call_server(...)
+            // - no  -> send back poll with key
 
-    //         let should_throttle: bool;
-    //         {
-    //             should_throttle = rate_limiter.lock().await.should_throttle();
-    //         }
+            let should_throttle: bool;
+            {
+                should_throttle = rate_limiter.lock().await.should_throttle();
+            }
 
-    //         if should_throttle {
-    //             unimplemented!()
-    //         } else {
-    //             match call_server(msg).await {
-    //                 Ok(_) => {}
-    //                 Err(a) => log::error!("{}", a),
-    //             };
-    //         }
+            if should_throttle {
+                unimplemented!()
+            } else {
+                let mut response = call_server(msg).await?;
+                stream.write(&mut response).await?;
 
-    //         unimplemented!()
-    //     }
-    //     Some(Request::AuthorizedRequest(request_key, msg)) => {
-    //         // Key valid?
-    //         // - yes -> call_server(...)
-    //         // - no  -> send back poll with key
+                Ok(())
+            }
+        }
+        Request::AuthorizedRequest(request_key, msg) => {
+            // Key valid?
+            // - yes -> call_server(...)
+            // - no  -> send back poll with key
 
-    //         unimplemented!()
-    //     }
-    //     Some(Request::Poll(poll_key)) => {
-    //         // Poll key ready to release?
-    //         // - yes -> provision request key
-    //         // - no  -> keep polling message
+            unimplemented!()
+        }
+        Request::Poll(poll_key) => {
+            // Poll key ready to release?
+            // - yes -> provision request key
+            // - no  -> keep polling message
 
-    //         unimplemented!()
-    //     }
-    //     None => log::error!("Request handle error"),
-    // };
+            unimplemented!()
+        }
+    }
 }
 
 #[tokio::main]
@@ -136,7 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _rate_limiter = rate_limiter.clone();
 
         spawn(async move {
-            handle_request(stream, _rate_limiter).await;
+            match handle_request(stream, _rate_limiter).await {
+                Ok(_) => log::info!("Request handled"),
+                Err(err) => log::error!("Request error: {}", err),
+            }
         });
     }
 }

@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use simple_logger::SimpleLogger;
 use tokio::{
@@ -19,6 +22,14 @@ struct Args {
     /// Gap between requests (in milliseconds).
     #[arg(short, long, default_value_t = 1)]
     gap: u64,
+
+    /// Port.
+    #[arg(short, long, default_value_t = 6789)]
+    port: u16,
+
+    /// Timeout for read (in seconds).
+    #[arg(short, long, default_value_t = 3)]
+    timeout: u64,
 }
 
 #[tokio::main]
@@ -32,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..args.count {
         let join_handle = spawn(async move {
-            let mut socket = TcpStream::connect("127.0.0.1:6789")
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), args.port);
+            let mut socket = TcpStream::connect(addr)
                 .await
                 .expect("Failed initiating connection");
             log::info!("Connecting to server");
@@ -42,7 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut buf: [u8; 32] = [0; 32];
 
-            let timeout_res = time::timeout(Duration::from_secs(3), socket.read(&mut buf)).await;
+            let timeout_res =
+                time::timeout(Duration::from_secs(args.timeout), socket.read(&mut buf)).await;
 
             if timeout_res.is_err() {
                 log::error!("Timeout error: {}", timeout_res.unwrap_err());
