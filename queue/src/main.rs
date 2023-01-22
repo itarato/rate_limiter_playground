@@ -1,4 +1,8 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use simple_logger::SimpleLogger;
 use tokio::{
@@ -9,15 +13,90 @@ use tokio::{
     time,
 };
 
-struct RateLimiter {}
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Rate in seconds.
+    #[arg(short, long, default_value_t = 4.0)]
+    rate: f64,
+}
+
+enum ShouldThrottle {
+    No,
+    Yes(u64),
+}
+
+enum CanExit {
+    No,
+    Yes(u64),
+}
+
+struct RateLimiter {
+    /// Poll key - assigned to pollers - to indicate their order.
+    next_poll_key: u64,
+    /// The poll ticket that can exit the queue.
+    releasable_poll_key: u64,
+    /// Last update time for `releasable_poll_key`.
+    last_update: SystemTime,
+    /// Poll exit rate: count per second.
+    rate: f64,
+}
 
 impl RateLimiter {
-    fn new() -> Self {
-        Self {}
+    fn new(rate: f64) -> Self {
+        Self {
+            next_poll_key: 0,
+            releasable_poll_key: 0,
+            last_update: SystemTime::now(),
+            rate,
+        }
     }
 
-    fn should_throttle(&self) -> bool {
-        false
+    fn should_throttle(&mut self) -> ShouldThrottle {
+        self.refresh_poll_release_key();
+
+        if self.next_poll_key < self.releasable_poll_key {
+            self.next_poll_key = self.releasable_poll_key;
+        }
+
+        self.next_poll_key += 1;
+        ShouldThrottle::Yes(self.next_poll_key - 1)
+    }
+
+    fn can_exit(&mut self, poll_key: u64) -> CanExit {
+        self.refresh_poll_release_key();
+
+        if poll_key <= self.releasable_poll_key {
+            CanExit::Yes(0xdeadbeef)
+        } else {
+            CanExit::No
+        }
+    }
+
+    fn refresh_poll_release_key(&mut self) {
+        // Update releasable pointer.
+        let elapsed_ms = self
+            .last_update
+            .elapsed()
+            .expect("Failed calculating time")
+            .as_millis() as f64;
+
+        self.last_update = SystemTime::now();
+
+        let increase = (elapsed_ms / 1000.0) * self.rate;
+        self.releasable_poll_key += increase as u64;
+    }
+
+    fn valid_request_key(&self, _request_key: u64) -> bool {
+        // For now lets consider they are all legit.
+        true
+    }
+
+    fn lower_rate(&mut self) {
+        self.rate = 1.0f64.max(self.rate - 1.0);
+        log::info!("Rate is lowered to: {}", self.rate);
     }
 }
 
@@ -27,7 +106,7 @@ enum Request {
     Poll(u64),
 }
 
-async fn call_server(mut msg: Vec<u8>) -> Result<(Vec<u8>), Box<dyn Error>> {
+async fn call_server(mut msg: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut socket = TcpStream::connect("127.0.0.1:5678")
         .await
         .map_err(|_| "Cannot connect to server")?;
@@ -78,37 +157,93 @@ async fn handle_request(
 
     match response {
         Request::UnauthorizedRequest(msg) => {
-            // Can be served?
-            // - yes -> call_server(...)
-            // - no  -> send back poll with key
-
-            let should_throttle: bool;
+            let should_throttle;
             {
                 should_throttle = rate_limiter.lock().await.should_throttle();
             }
 
-            if should_throttle {
-                unimplemented!()
-            } else {
-                let mut response = call_server(msg).await?;
-                stream.write(&mut response).await?;
+            match should_throttle {
+                ShouldThrottle::Yes(poll_key) => {
+                    let mut buf_out: [u8; 12] = [0; 12];
+                    buf_out[..4].clone_from_slice(&b"POLL"[..]);
+                    buf_out[4..12].clone_from_slice(&poll_key.to_be_bytes());
 
-                Ok(())
-            }
+                    stream.write(&mut buf_out).await?;
+
+                    log::info!("Client asked to poll with key: {}", poll_key);
+                }
+                ShouldThrottle::No => {
+                    let mut response = call_server(msg).await?;
+                    stream.write(&mut response).await?;
+
+                    log::info!("Client can skip queue");
+                }
+            };
+
+            Ok(())
         }
         Request::AuthorizedRequest(request_key, msg) => {
-            // Key valid?
-            // - yes -> call_server(...)
-            // - no  -> send back poll with key
+            let is_valid;
+            {
+                is_valid = rate_limiter.lock().await.valid_request_key(request_key);
+            }
 
-            unimplemented!()
+            if is_valid {
+                let mut server_response: Option<Vec<u8>> = None;
+                {
+                    let server_result = call_server(msg).await;
+                    if server_result.is_err() {
+                        log::error!("Error from the server call: {}", server_result.unwrap_err());
+                    } else {
+                        server_response = Some(server_result.unwrap());
+                    }
+                }
+
+                {
+                    if server_response.is_none() {
+                        rate_limiter.lock().await.lower_rate();
+                        return Err("Server request error - decreased rate".into());
+                    }
+                }
+
+                stream.write(&mut server_response.unwrap()).await?;
+                log::info!("Client was authorized to make request: {}", request_key);
+            } else {
+                unimplemented!()
+            }
+
+            Ok(())
         }
         Request::Poll(poll_key) => {
-            // Poll key ready to release?
-            // - yes -> provision request key
-            // - no  -> keep polling message
+            let can_exit;
+            {
+                can_exit = rate_limiter.lock().await.can_exit(poll_key);
+            }
 
-            unimplemented!()
+            match can_exit {
+                CanExit::Yes(request_key) => {
+                    let mut buf_out: [u8; 15] = [0; 15];
+                    buf_out[..7].clone_from_slice(&b"REQUEST"[..]);
+                    buf_out[7..15].clone_from_slice(&request_key.to_be_bytes());
+
+                    stream.write(&mut buf_out).await?;
+
+                    log::info!(
+                        "Client can exit poll with key: {} -> request key {}",
+                        poll_key,
+                        request_key
+                    );
+                }
+                CanExit::No => {
+                    let mut buf_out: [u8; 4] = *b"POLL";
+
+                    stream.write(&mut buf_out).await?;
+
+                    log::info!("Client asked to keep polling for key: {}", poll_key);
+                }
+            };
+
+            Ok(())
         }
     }
 }
@@ -116,11 +251,12 @@ async fn handle_request(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new().init().unwrap();
+    let args = Args::parse();
 
     let listener = TcpListener::bind("0.0.0.0:6789").await?;
     log::info!("Listening on 6789");
 
-    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(args.rate)));
 
     loop {
         let (stream, _addr) = listener.accept().await?;

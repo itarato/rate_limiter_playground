@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use simple_logger::SimpleLogger;
 use tokio::{

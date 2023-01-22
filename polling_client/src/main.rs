@@ -140,15 +140,13 @@ impl PollingClient {
         let mut buf: [u8; 32] = [0; 32];
         let resp_len = time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await??;
 
-        log::info!(
-            "Got back {} bytes: {}",
-            resp_len,
-            String::from_utf8_lossy(&mut buf)
-        );
+        log::info!("Got back {} bytes", resp_len);
 
         if resp_len == b"POLL".len() && buf[..4] == b"POLL"[..] {
+            log::info!("Response: POLL");
             Ok(Response::KeepPolling)
         } else if resp_len == b"POLL".len() + 8 && buf[..4] == b"POLL"[..] {
+            log::info!("Response: POLL + <key>");
             let request_key = u64::from_be_bytes(
                 buf[4..12]
                     .try_into()
@@ -156,6 +154,7 @@ impl PollingClient {
             );
             Ok(Response::StartPoll(request_key))
         } else if resp_len == b"REQUEST".len() + 8 && buf[..7] == b"REQUEST"[..] {
+            log::info!("Response: REQUEST + <key>");
             let request_key = u64::from_be_bytes(
                 buf[7..15]
                     .try_into()
@@ -163,6 +162,7 @@ impl PollingClient {
             );
             Ok(Response::RequestGranted(request_key))
         } else {
+            log::info!("Response: pong");
             Ok(Response::Pong(buf[..resp_len].to_vec()))
         }
     }
