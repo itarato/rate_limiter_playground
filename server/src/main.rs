@@ -46,7 +46,7 @@ async fn broadcast_backlog(job_queue: Arc<Mutex<VecDeque<TcpStream>>>) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     SimpleLogger::new().init().unwrap();
 
     let args = Args::parse();

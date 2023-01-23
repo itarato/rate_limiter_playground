@@ -1,7 +1,6 @@
 use std::{
-    error::Error,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use simple_logger::SimpleLogger;
@@ -14,6 +13,8 @@ use tokio::{
 };
 
 use clap::Parser;
+
+type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -42,6 +43,8 @@ struct RateLimiter {
     last_update: SystemTime,
     /// Poll exit rate: count per second.
     rate: f64,
+    /// Timestamp on which the last rate reduction has been called.
+    last_rate_reduce_second: u64,
 }
 
 impl RateLimiter {
@@ -51,6 +54,7 @@ impl RateLimiter {
             releasable_poll_key: 0,
             last_update: SystemTime::now(),
             rate,
+            last_rate_reduce_second: UNIX_EPOCH.elapsed().expect("Cannot get epoch").as_secs(),
         }
     }
 
@@ -83,10 +87,12 @@ impl RateLimiter {
             .expect("Failed calculating time")
             .as_millis() as f64;
 
-        self.last_update = SystemTime::now();
+        let increase = ((elapsed_ms / 1000.0) * self.rate) as u64;
+        self.releasable_poll_key += increase;
 
-        let increase = (elapsed_ms / 1000.0) * self.rate;
-        self.releasable_poll_key += increase as u64;
+        if increase > 0 {
+            self.last_update = SystemTime::now();
+        }
     }
 
     fn valid_request_key(&self, _request_key: u64) -> bool {
@@ -95,8 +101,17 @@ impl RateLimiter {
     }
 
     fn lower_rate(&mut self) {
+        let current_timestamp = UNIX_EPOCH.elapsed().expect("Cannot get epoch").as_secs();
+
+        if current_timestamp <= self.last_rate_reduce_second {
+            log::info!("Reduction rejected - already done one in this second");
+            return;
+        }
+
         self.rate = 1.0f64.max(self.rate - 1.0);
         log::info!("Rate is lowered to: {}", self.rate);
+
+        self.last_rate_reduce_second = current_timestamp;
     }
 }
 
@@ -106,7 +121,7 @@ enum Request {
     Poll(u64),
 }
 
-async fn call_server(mut msg: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
+async fn call_server(mut msg: Vec<u8>) -> Result<Vec<u8>, Error> {
     let mut socket = TcpStream::connect("127.0.0.1:5678")
         .await
         .map_err(|_| "Cannot connect to server")?;
@@ -129,7 +144,7 @@ async fn call_server(mut msg: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(buf[..read_len].to_vec())
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<Request, Box<dyn Error>> {
+async fn read_request(stream: &mut TcpStream) -> Result<Request, Error> {
     let mut buf: [u8; 32] = [0; 32];
     let read_len = stream.read(&mut buf).await?;
 
@@ -152,8 +167,18 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, Box<dyn Error>>
 async fn handle_request(
     mut stream: TcpStream,
     rate_limiter: Arc<Mutex<RateLimiter>>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     let response = read_request(&mut stream).await?;
+
+    {
+        let rl = rate_limiter.lock().await;
+        log::debug!(
+            "RL >> rate: {} | next poll: {} | release: {}",
+            rl.rate,
+            rl.next_poll_key,
+            rl.releasable_poll_key
+        );
+    }
 
     match response {
         Request::UnauthorizedRequest(msg) => {
@@ -183,36 +208,21 @@ async fn handle_request(
             Ok(())
         }
         Request::AuthorizedRequest(request_key, msg) => {
-            let is_valid;
-            {
-                is_valid = rate_limiter.lock().await.valid_request_key(request_key);
-            }
-
-            if is_valid {
-                let mut server_response: Option<Vec<u8>> = None;
-                {
-                    let server_result = call_server(msg).await;
-                    if server_result.is_err() {
-                        log::error!("Error from the server call: {}", server_result.unwrap_err());
-                    } else {
-                        server_response = Some(server_result.unwrap());
+            if rate_limiter.lock().await.valid_request_key(request_key) {
+                match call_server(msg).await {
+                    Ok(mut response) => {
+                        stream.write(&mut response).await?;
+                        log::info!("Client was authorized to make request: {}", request_key);
+                        Ok(())
                     }
-                }
-
-                {
-                    if server_response.is_none() {
+                    Err(err) => {
                         rate_limiter.lock().await.lower_rate();
-                        return Err("Server request error - decreased rate".into());
+                        Err(err)
                     }
                 }
-
-                stream.write(&mut server_response.unwrap()).await?;
-                log::info!("Client was authorized to make request: {}", request_key);
             } else {
                 unimplemented!()
             }
-
-            Ok(())
         }
         Request::Poll(poll_key) => {
             let can_exit;
